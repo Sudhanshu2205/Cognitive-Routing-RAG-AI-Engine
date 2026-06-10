@@ -1,5 +1,6 @@
-sentence-transformers==2.7.0
-chromadb==0.5.3
+fastapi
+uvicorn
+requests
 langchain==0.2.16
 langchain-groq==0.1.9
 langchain-core==0.2.39
