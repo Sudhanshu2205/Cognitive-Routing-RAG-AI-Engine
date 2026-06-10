@@ -1,15 +1,15 @@
 """
 router.py -- Phase 1: Vector-Based Persona Matching (Vercel Serverless Ready)
 
-This module implements the persona matching logic:
-- Fetches text embeddings from the Hugging Face Inference API (all-MiniLM-L6-v2).
-- Calculates cosine similarity in pure Python (no ChromaDB/PyTorch needed).
-- Filters matches using the provided similarity threshold.
+This module implements the persona matching logic using a self-contained
+TF-IDF vectorizer and cosine similarity calculation. No external API calls
+are needed — everything runs in-process, ensuring instant results and
+zero network dependencies on Vercel's serverless environment.
 """
 
-import os
-import time
-import requests
+import math
+import re
+from collections import Counter
 
 # The default bot personas
 BOT_PERSONAS = {
@@ -27,72 +27,103 @@ BOT_PERSONAS = {
     ),
 }
 
-HF_API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+# Common English stop words to filter out for better similarity matching
+STOP_WORDS = frozenset([
+    "i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you", "your",
+    "yours", "yourself", "yourselves", "he", "him", "his", "himself", "she", "her",
+    "hers", "herself", "it", "its", "itself", "they", "them", "their", "theirs",
+    "themselves", "what", "which", "who", "whom", "this", "that", "these", "those",
+    "am", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "having", "do", "does", "did", "doing", "a", "an", "the", "and", "but", "if",
+    "or", "because", "as", "until", "while", "of", "at", "by", "for", "with",
+    "about", "against", "between", "through", "during", "before", "after", "above",
+    "below", "to", "from", "up", "down", "in", "out", "on", "off", "over", "under",
+    "again", "further", "then", "once", "here", "there", "when", "where", "why",
+    "how", "all", "both", "each", "few", "more", "most", "other", "some", "such",
+    "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "s",
+    "t", "can", "will", "just", "don", "should", "now", "d", "ll", "m", "o", "re",
+    "ve", "y", "ain", "aren", "couldn", "didn", "doesn", "hadn", "hasn", "haven",
+    "isn", "ma", "mightn", "mustn", "needn", "shan", "shouldn", "wasn", "weren",
+    "won", "wouldn",
+])
 
-def get_hf_embedding(text: str, token: str = None) -> list:
+
+def tokenize(text: str) -> list[str]:
+    """Tokenizes text into lowercase words, removing stop words and short tokens."""
+    words = re.findall(r'[a-zA-Z]+', text.lower())
+    return [w for w in words if w not in STOP_WORDS and len(w) > 1]
+
+
+def compute_tfidf_vectors(documents: list[str]) -> tuple[list[dict], dict]:
     """
-    Retrieves the text embedding from Hugging Face Inference API.
-    Handles automatic model loading wait times.
+    Computes TF-IDF vectors for a list of documents.
+    
+    Returns:
+        Tuple of (list of TF-IDF vector dicts, IDF dict)
     """
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    elif os.getenv("HF_TOKEN"):
-        headers["Authorization"] = f"Bearer {os.getenv('HF_TOKEN')}"
+    # Tokenize all documents
+    tokenized_docs = [tokenize(doc) for doc in documents]
+    
+    # Compute document frequency (DF) for each term
+    num_docs = len(tokenized_docs)
+    df = Counter()
+    for tokens in tokenized_docs:
+        unique_tokens = set(tokens)
+        for token in unique_tokens:
+            df[token] += 1
+    
+    # Compute IDF: log(N / df) with smoothing
+    idf = {}
+    for term, freq in df.items():
+        idf[term] = math.log((num_docs + 1) / (freq + 1)) + 1  # smooth IDF
+    
+    # Compute TF-IDF for each document
+    tfidf_vectors = []
+    for tokens in tokenized_docs:
+        tf = Counter(tokens)
+        total_terms = len(tokens) if tokens else 1
+        
+        vector = {}
+        for term, count in tf.items():
+            tf_val = count / total_terms
+            vector[term] = tf_val * idf.get(term, 1.0)
+        
+        tfidf_vectors.append(vector)
+    
+    return tfidf_vectors, idf
 
-    # Try up to 5 times if model is loading
-    for attempt in range(5):
-        try:
-            response = requests.post(
-                HF_API_URL,
-                headers=headers,
-                json={"inputs": text, "options": {"wait_for_model": True}},
-                timeout=15
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                # Sometimes HF returns a 2D array if inputs was wrapped in a list
-                if isinstance(result, list):
-                    if len(result) > 0 and isinstance(result[0], list):
-                        return result[0]
-                    return result
-                raise ValueError(f"Unexpected HF response format: {result}")
-            
-            # Handle model loading
-            res_json = response.json()
-            if "estimated_time" in res_json:
-                wait_time = min(res_json.get("estimated_time", 5), 5)
-                time.sleep(wait_time)
-                continue
-                
-            raise ValueError(f"HF API Error ({response.status_code}): {response.text}")
-            
-        except requests.exceptions.RequestException as e:
-            if attempt == 4:
-                raise e
-            time.sleep(1)
-            
-    raise RuntimeError("Failed to retrieve embeddings from Hugging Face API: Model loading timed out.")
 
-def cosine_similarity(v1: list, v2: list) -> float:
-    """Calculates the cosine similarity between two numeric vectors."""
-    dot_product = sum(x * y for x, y in zip(v1, v2))
-    magnitude1 = sum(x * x for x in v1) ** 0.5
-    magnitude2 = sum(x * x for x in v2) ** 0.5
-    if not magnitude1 or not magnitude2:
+def cosine_similarity_sparse(v1: dict, v2: dict) -> float:
+    """Computes cosine similarity between two sparse vectors (dicts)."""
+    # Find common terms
+    common_terms = set(v1.keys()) & set(v2.keys())
+    
+    dot_product = sum(v1[t] * v2[t] for t in common_terms)
+    
+    mag1 = math.sqrt(sum(val ** 2 for val in v1.values())) if v1 else 0
+    mag2 = math.sqrt(sum(val ** 2 for val in v2.values())) if v2 else 0
+    
+    if mag1 == 0 or mag2 == 0:
         return 0.0
-    return dot_product / (magnitude1 * magnitude2)
+    
+    return dot_product / (mag1 * mag2)
 
-def route_post_to_bots(post_content: str, threshold: float = 0.20, personas: dict = None, hf_token: str = None) -> list:
+
+def route_post_to_bots(
+    post_content: str,
+    threshold: float = 0.20,
+    personas: dict = None,
+    hf_token: str = None  # kept for API compatibility, not used
+) -> list:
     """
-    Stateless routing function. Embeds the post and matches against bot personas.
+    Stateless routing function. Computes TF-IDF similarity between
+    the post and each bot persona.
     
     Args:
         post_content: Content of the post.
         threshold: Cosine similarity cutoff.
         personas: Persona dictionary mapping bot ID to persona description.
-        hf_token: Optional Hugging Face Token.
+        hf_token: Unused, kept for API compatibility.
         
     Returns:
         List of dicts: [{"bot_id": str, "similarity": float}]
@@ -100,34 +131,51 @@ def route_post_to_bots(post_content: str, threshold: float = 0.20, personas: dic
     if not personas:
         personas = BOT_PERSONAS
 
-    # 1. Fetch embedding for post
-    post_vector = get_hf_embedding(post_content, token=hf_token)
+    bot_ids = list(personas.keys())
+    persona_texts = list(personas.values())
     
-    # 2. Fetch embeddings for all bot personas and calculate similarities
+    # Build TF-IDF vectors for all documents together (post + all personas)
+    all_documents = [post_content] + persona_texts
+    tfidf_vectors, _ = compute_tfidf_vectors(all_documents)
+    
+    post_vector = tfidf_vectors[0]
+    persona_vectors = tfidf_vectors[1:]
+    
+    # Calculate similarities and filter by threshold
     matched_bots = []
-    
-    for bot_id, persona_text in personas.items():
-        persona_vector = get_hf_embedding(persona_text, token=hf_token)
-        similarity = cosine_similarity(post_vector, persona_vector)
-        
+    for i, bot_id in enumerate(bot_ids):
+        similarity = cosine_similarity_sparse(post_vector, persona_vectors[i])
         if similarity >= threshold:
             matched_bots.append({
                 "bot_id": bot_id,
                 "similarity": round(similarity, 4)
             })
-            
+    
     # Sort matches by similarity score descending
     matched_bots.sort(key=lambda x: x["similarity"], reverse=True)
     return matched_bots
 
-if __name__ == "__main__":
-    # Test locally
-    import dotenv
-    dotenv.load_dotenv()
-    test_post = "OpenAI just released a new model that might replace junior developers."
-    print("Testing routing...")
-    try:
-        matches = route_post_to_bots(test_post)
-        print("Matches:", matches)
-    except Exception as e:
-        print("Error during test routing:", e)
+
+def get_all_scores(post_content: str, personas: dict = None) -> dict:
+    """
+    Returns similarity scores for ALL personas (not just those above threshold).
+    Used by the API to populate the frontend visualizer.
+    """
+    if not personas:
+        personas = BOT_PERSONAS
+
+    bot_ids = list(personas.keys())
+    persona_texts = list(personas.values())
+    
+    all_documents = [post_content] + persona_texts
+    tfidf_vectors, _ = compute_tfidf_vectors(all_documents)
+    
+    post_vector = tfidf_vectors[0]
+    persona_vectors = tfidf_vectors[1:]
+    
+    scores = {}
+    for i, bot_id in enumerate(bot_ids):
+        similarity = cosine_similarity_sparse(post_vector, persona_vectors[i])
+        scores[bot_id] = round(similarity, 4)
+    
+    return scores

@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from api.router import route_post_to_bots
+from api.router import route_post_to_bots, get_all_scores
 from api.content_engine import build_content_graph
 from api.rag_engine import generate_defense_reply, detect_injection
 
@@ -37,7 +37,6 @@ class RouteRequest(BaseModel):
     post_content: str
     threshold: float = 0.20
     personas: Optional[Dict[str, str]] = None
-    hf_token: Optional[str] = None
 
 class ContentGraphRequest(BaseModel):
     bot_id: str
@@ -74,22 +73,9 @@ def route_post(data: RouteRequest):
             post_content=data.post_content,
             threshold=data.threshold,
             personas=data.personas,
-            hf_token=data.hf_token
         )
-        # Reconstruct the expected response dictionary format
-        scores = {bot_id: 0.0 for bot_id in (data.personas or {}).keys()}
-        
-        # Calculate full scores list for graphing on the frontend
-        # (even those below similarity threshold)
-        from api.router import get_hf_embedding, cosine_similarity, BOT_PERSONAS
-        active_personas = data.personas or BOT_PERSONAS
-        
-        post_vector = get_hf_embedding(data.post_content, token=data.hf_token)
-        all_scores = {}
-        for bot_id, persona_text in active_personas.items():
-            persona_vector = get_hf_embedding(persona_text, token=data.hf_token)
-            similarity = cosine_similarity(post_vector, persona_vector)
-            all_scores[bot_id] = round(similarity, 4)
+        # Calculate full scores for all personas (even those below threshold)
+        all_scores = get_all_scores(data.post_content, personas=data.personas)
             
         return {
             "post": data.post_content,
